@@ -9,6 +9,6 @@ class FileRead(BaseModel):
     filename: str
     remote_path: str
     uploaded_at: datetime
-
+    url: str
     class Config:
         orm_mode = True

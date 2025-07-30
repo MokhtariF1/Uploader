@@ -11,7 +11,7 @@ from ..security import verify_token
 import aiofiles
 import tempfile
 import os
-import shutil
+import aioftp
 
 router = APIRouter(tags=["files"])
 security = HTTPBearer()
@@ -43,25 +43,25 @@ async def upload_file(
 
         # آپلود به FTP
         ftp = FTPClient(**FTP_CONFIG)
-        remote_path = f"public_html/uploads/{user_id}/{file.filename}"
+        file_name, _ = os.path.splitext(file.filename)
+        remote_path = f"public_html/uploads/{user_id}/{file_name}"
         await ftp.upload(temp_path, remote_path)
 
         # پاک کردن فایل موقت
         os.remove(temp_path)
         remote_path = remote_path.split("/")
-        print(remote_path)
         remote_path.pop(0)
-        print(remote_path)
         remote_path = "/".join(remote_path)
-        print(remote_path)
+        remote_path, _ = os.path.splitext(remote_path)
         # گرفتن URL عمومی (در صورت نیاز)
-        url = await ftp.get_public_url(remote_path)
+        url = await ftp.get_public_url(remote_path, suffix=temp_path.split(os.sep)[-1])
 
         # ذخیره رکورد در دیتابیس
         db_file = FileModel(
             user_id=user_id,
-            filename=file.filename,
+            filename=file_name,
             remote_path=remote_path,
+            url=url,
         )
         db.add(db_file)
         await db.commit()
@@ -99,20 +99,36 @@ async def get_file(
     return db_file
 
 
-@router.delete("/{file_id}")
+@router.delete("/{file_id}", status_code=204)
 async def delete_file(
     file_id: int,
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    credentials: HTTPAuthorizationCredentials = Depends(security),  # توکن bearer
     db: AsyncSession = Depends(get_db)
 ):
+    # ۱. اعتبارسنجی توکن و استخراج user_id
     payload = verify_token(credentials.credentials)
     user_id = int(payload.sub)
-    result = await db.execute(select(FileModel).where(FileModel.id == file_id, FileModel.user_id == user_id))
+
+    # ۲. بررسی مالکیت فایل
+    result = await db.execute(
+        select(FileModel).where(FileModel.id == file_id, FileModel.user_id == user_id)
+    )
     db_file = result.scalar_one_or_none()
+
     if not db_file:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+
+    # ۳. حذف فایل از FTP
+    ftp_path = f"public_html/{db_file.remote_path}"
     ftp = FTPClient(**FTP_CONFIG)
-    await ftp.upload(None, None)  # implement delete logic if supported
+    try:
+        print(ftp_path)
+        await ftp.delete_folder(ftp_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete from FTP: {str(e)}")
+
+    # ۴. حذف رکورد از دیتابیس
     await db.delete(db_file)
     await db.commit()
-    return {"msg": "Deleted"}
+
+    return
